@@ -50,7 +50,9 @@ def generate_diagram(process_description: str) -> str:
     lines = escaped.splitlines() or [escaped]
     line_height = 20
     padding = 16
-    width = max(len(line) for line in lines) * 8 + padding * 2
+    max_width = 800
+    raw_width = max(len(line) for line in lines) * 8 + padding * 2
+    width = min(raw_width, max_width)
     height = len(lines) * line_height + padding * 2 + 30  # 30 for the title bar
 
     text_elements = "\n".join(
