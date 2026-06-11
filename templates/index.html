@@ -26,6 +26,9 @@
     <section class="diagram-section">
       <h2>Generated Diagram</h2>
       <div class="diagram-container">
+        {# diagram_svg must be a sanitized SVG string.
+           generate_diagram() is responsible for escaping all user-supplied
+           content before returning; do not pass unsanitized input here. #}
         {{ diagram_svg | safe }}
       </div>
     </section>

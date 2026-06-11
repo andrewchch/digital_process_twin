@@ -20,12 +20,16 @@ def generate_diagram(process_description: str) -> str:
 
     Returns:
         An SVG string that can be embedded directly in an HTML page, or an
-        empty string when no description is supplied.
+        empty string when no description is supplied.  The returned string
+        **must** be fully sanitized – all user-supplied text must be
+        HTML-escaped before inclusion so that the SVG is safe to render with
+        Jinja2's ``| safe`` filter.
 
     Note:
         This is a stub.  The returned SVG is a placeholder diagram that shows
         the supplied text inside a simple box.  Replace this function body
-        with the real diagram-generation logic.
+        with the real diagram-generation logic, ensuring that the sanitization
+        contract above is preserved.
     """
     if not process_description or not process_description.strip():
         return ""

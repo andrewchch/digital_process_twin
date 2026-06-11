@@ -1,5 +1,7 @@
 """Flask web application for generating process diagrams."""
 
+import os
+
 from flask import Flask, render_template, request
 from process_diagram import generate_diagram
 
@@ -23,4 +25,5 @@ def index():
 
 
 if __name__ == "__main__":
-    app.run(debug=True)
+    debug = os.getenv("FLASK_DEBUG", "false").lower() == "true"
+    app.run(debug=debug)
