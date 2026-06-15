@@ -1,0 +1,38 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Process Diagram Generator</title>
+  <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+</head>
+<body>
+  <div class="container">
+    <h1>Process Diagram Generator</h1>
+    <p class="subtitle">Describe your process below and click <strong>Generate Diagram</strong>.</p>
+
+    <form method="post" action="/">
+      <label for="process_description">Process Description</label>
+      <textarea
+        id="process_description"
+        name="process_description"
+        rows="10"
+        placeholder="Enter your process description here…&#10;&#10;Example:&#10;Step 1 – Receive customer request&#10;Step 2 – Validate input&#10;Step 3 – Process order&#10;Step 4 – Send confirmation"
+      >{{ process_description }}</textarea>
+      <button type="submit">Generate Diagram</button>
+    </form>
+
+    {% if diagram_svg %}
+    <section class="diagram-section">
+      <h2>Generated Diagram</h2>
+      <div class="diagram-container">
+        {# diagram_svg must be a sanitized SVG string.
+           generate_diagram() is responsible for escaping all user-supplied
+           content before returning; do not pass unsanitized input here. #}
+        {{ diagram_svg | safe }}
+      </div>
+    </section>
+    {% endif %}
+  </div>
+</body>
+</html>
