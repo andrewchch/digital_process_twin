@@ -87,6 +87,79 @@ class WorkItem:
 
 
 # ---------------------------------------------------------------------------
+# Event — the event-driven primitive
+# ---------------------------------------------------------------------------
+
+@dataclass
+class Event:
+    """
+    An event raised by an actor or the system during process execution.
+
+    Events decouple the producer of an action from its consumers — actors
+    subscribe to events they are interested in and react via on_event().
+    The payload carries any data the publisher wishes to share alongside
+    the named event; consumers should prefer the shared context dict for
+    structured process state.
+    """
+
+    name: str
+    source: str                            # Actor.name or "System" that raised this event
+    payload: dict[str, Any] = field(default_factory=dict)
+    timestamp: datetime = field(default_factory=datetime.now)
+
+    def __str__(self) -> str:
+        return (
+            f"Event({self.name!r}, source={self.source!r}, "
+            f"at={self.timestamp.strftime('%H:%M:%S')})"
+        )
+
+
+class EventBus:
+    """
+    Simple synchronous event bus for routing events between actors.
+
+    Actors register interest in named events via subscribe().  When an
+    event is published, every subscribed actor's on_event() method is
+    called in registration order.  The shared process context dict is
+    threaded through each handler so that side-effects accumulate.
+
+    Usage::
+
+        bus = EventBus()
+        bus.subscribe("document_submitted", system_actor_instance)
+        context = bus.publish(Event("document_submitted", "Author"), context)
+    """
+
+    def __init__(self) -> None:
+        self._subscribers: dict[str, list[Actor]] = {}
+        self._history: list[Event] = []
+
+    def subscribe(self, event_name: str, actor: Actor) -> None:
+        """Register *actor* to receive events whose name matches *event_name*."""
+        self._subscribers.setdefault(event_name, []).append(actor)
+
+    def publish(self, event: Event, context: dict[str, Any]) -> dict[str, Any]:
+        """
+        Dispatch *event* to all subscribed actors.
+
+        Each subscriber's on_event() is called in registration order.
+        Returns the (possibly modified) context after all handlers run.
+        Actors that have not implemented on_event() raise NotImplementedError,
+        which is surfaced here so callers can react accordingly.
+        """
+        self._history.append(event)
+        print(f"  [EVENT] {event.name} (source: {event.source})")
+        for actor in self._subscribers.get(event.name, []):
+            context = actor.on_event(event, self, context)
+        return context
+
+    @property
+    def history(self) -> list[Event]:
+        """Return a copy of every event published so far, in order."""
+        return list(self._history)
+
+
+# ---------------------------------------------------------------------------
 # Process — the orchestrator and collaboration surface
 # ---------------------------------------------------------------------------
 
@@ -242,12 +315,26 @@ class Process(ABC):
         # Actors with no steps
         for actor_cls in actor_classes:
             if actor_cls.__name__ not in actors_with_steps:
-                self.raise_gap(
-                    f"Actor has no steps assigned — is this role needed?",
-                    raised_by="Process.validate",
-                    linked_to=actor_cls.__name__,
-                    type=WorkItemType.QUESTION,
-                )
+                # An actor with event subscriptions participates via on_event(),
+                # not necessarily via Steps — only raise the question when the
+                # actor has neither steps nor subscriptions.
+                if not getattr(actor_cls, "subscriptions", []):
+                    self.raise_gap(
+                        f"Actor has no steps assigned — is this role needed?",
+                        raised_by="Process.validate",
+                        linked_to=actor_cls.__name__,
+                        type=WorkItemType.QUESTION,
+                    )
+
+        # Event-driven: actors with subscriptions but missing on_event()
+        for actor_cls in actor_classes:
+            if getattr(actor_cls, "subscriptions", []):
+                if _is_not_implemented(actor_cls, "on_event"):
+                    self.raise_gap(
+                        "on_event() is not implemented — actor cannot respond to events.",
+                        raised_by="Process.validate",
+                        linked_to=actor_cls.__name__,
+                    )
 
         return self.work_items
 
@@ -369,6 +456,114 @@ class Process(ABC):
         print(self.generate_mermaid())
         print("```\n")
 
+    def generate_event_mermaid(self) -> str:
+        """
+        Generate a Mermaid flowchart showing the event-driven actor flow.
+
+        The diagram is derived from the Actor subclasses' ``subscriptions``
+        and ``publishes`` class attributes.  Edges represent events flowing
+        between actors; node shape indicates whether on_event() is implemented.
+        """
+        lines = ["flowchart TD"]
+        lines.append(f'    %% {self.name} — Event-Driven Flow')
+
+        actor_classes = self.actors()
+
+        lines.append(f'    START([External Request])')
+        lines.append(f'    END([Process Complete])')
+
+        # Build a lookup: event_name → list of actor classes that publish it
+        publishers: dict[str, list[Type[Actor]]] = {}
+        for actor_cls in actor_classes:
+            for event_name in getattr(actor_cls, "publishes", []):
+                publishers.setdefault(event_name, []).append(actor_cls)
+
+        # Emit actor nodes
+        for actor_cls in actor_classes:
+            aname = actor_cls.__name__
+            label = actor_cls.name
+            not_impl = _is_not_implemented(actor_cls, "on_event")
+            shape_open  = "{{" if not_impl else "["
+            shape_close = "}}" if not_impl else "]"
+            subs = getattr(actor_cls, "subscriptions", [])
+            pubs = getattr(actor_cls, "publishes", [])
+            subs_txt = ", ".join(subs) if subs else "—"
+            pubs_txt = ", ".join(pubs) if pubs else "—"
+            lines.append(
+                f'    {aname}{shape_open}"{label}<br/>'
+                f'<small>subscribes: {subs_txt}</small>"{shape_close}'
+            )
+            lines.append(f'    %% publishes: {pubs_txt}')
+
+        # Emit edges: for each subscription, trace the publisher
+        for actor_cls in actor_classes:
+            for event_name in getattr(actor_cls, "subscriptions", []):
+                safe_label = event_name.replace('"', "'")
+                pub_list = publishers.get(event_name, [])
+                if pub_list:
+                    for pub_cls in pub_list:
+                        lines.append(
+                            f'    {pub_cls.__name__} -->|"{safe_label}"| {actor_cls.__name__}'
+                        )
+                else:
+                    # No actor publishes this event — it originates externally
+                    lines.append(
+                        f'    START -->|"{safe_label}"| {actor_cls.__name__}'
+                    )
+
+        diagram = "\n".join(lines)
+        return diagram
+
+    def print_event_mermaid(self) -> None:
+        """Print the event-driven Mermaid diagram to stdout, wrapped in a code fence."""
+        print("\n```mermaid")
+        print(self.generate_event_mermaid())
+        print("```\n")
+
+    # -- Event-driven execution ----------------------------------------------
+
+    def register_actors(self, bus: EventBus) -> None:
+        """
+        Instantiate each actor and register it with *bus* for every event
+        it declares in its ``subscriptions`` class attribute.
+        """
+        for actor_cls in self.actors():
+            subs = getattr(actor_cls, "subscriptions", [])
+            if subs:
+                actor = actor_cls()
+                for event_name in subs:
+                    bus.subscribe(event_name, actor)
+
+    def run_event_driven(
+        self,
+        initial_event: Event,
+        context: dict[str, Any],
+    ) -> dict[str, Any]:
+        """
+        Execute the process in event-driven mode.
+
+        Registers all actors with a fresh EventBus, then publishes
+        *initial_event* to start the chain.  Actors handle events and
+        publish further events, driving the process forward without
+        central step-by-step orchestration.
+
+        The shared *context* dict accumulates process state as events
+        propagate — actors read from it and write their outputs back.
+        """
+        bus = EventBus()
+        self.register_actors(bus)
+        print(f"\n▶ Running (event-driven): {self.name}")
+        print("─" * 60)
+        try:
+            context = bus.publish(initial_event, context)
+        except NotImplementedError as exc:
+            print(f"     ⚠ NotImplementedError — {exc}")
+        except Exception as exc:
+            print(f"     ✗ Unhandled error: {exc}")
+        print("─" * 60)
+        print(f"✓ Event-driven process complete.\n")
+        return context
+
 
 # ---------------------------------------------------------------------------
 # Actor base class
@@ -382,13 +577,18 @@ class Actor(ABC):
     may fill multiple roles; multiple people may fill the same role.
 
     Subclasses define:
-      - name        → display name of the role
-      - description → what this role is responsible for in the process
-      - perform()   → dispatch an action this actor can take
+      - name          → display name of the role
+      - description   → what this role is responsible for in the process
+      - subscriptions → list of event names this actor reacts to
+      - publishes     → list of event names this actor can raise
+      - perform()     → dispatch a named action this actor can carry out
+      - on_event()    → handle an inbound event from the EventBus
     """
 
     name: str = "Unnamed Actor"
     description: str = ""
+    subscriptions: list[str] = []   # Event names this actor subscribes to
+    publishes: list[str] = []       # Event names this actor may publish
 
     def perform(self, action: str, context: dict[str, Any]) -> dict[str, Any]:
         """
@@ -409,6 +609,20 @@ class Actor(ABC):
         """
         raise NotImplementedError(
             f"{self.__class__.__name__}.notify() is not implemented."
+        )
+
+    def on_event(self, event: Event, bus: EventBus, context: dict[str, Any]) -> dict[str, Any]:
+        """
+        Handle an event received from the EventBus.
+
+        Override in subclasses to implement event-driven actor behaviour.
+        The actor may read from and write to the shared *context* dict, and
+        may publish new events via *bus* to trigger downstream actors.
+
+        Raise NotImplementedError to mark this handler as an open gap.
+        """
+        raise NotImplementedError(
+            f"{self.__class__.__name__}.on_event('{event.name}') is not implemented."
         )
 
 
@@ -671,10 +885,16 @@ class AuthorActor(Actor):
 
     Responsible for: creating drafts, editing rejected documents,
     and setting the initial access policy proposal.
+
+    Event subscriptions:
+      - document_creation_requested → create, edit, and submit a new draft
+      - document_rejected           → revise draft and re-submit for approval
     """
 
     name = "Author"
     description = "Creates, edits, and submits documents for approval."
+    subscriptions = ["document_creation_requested", "document_rejected"]
+    publishes = ["document_submitted"]
 
     def perform(self, action: str, context: dict[str, Any]) -> dict[str, Any]:
         if action == "create_draft":
@@ -703,6 +923,37 @@ class AuthorActor(Actor):
         # GAP: Implement email / in-app notification to the author.
         raise NotImplementedError("AuthorActor.notify() is not implemented.")
 
+    def on_event(self, event: Event, bus: EventBus, context: dict[str, Any]) -> dict[str, Any]:
+        if event.name == "document_creation_requested":
+            # Create the document draft
+            context = self.perform("create_draft", context)
+            print(f"     Document '{context['document'].title}' created (DRAFT).")
+            # Edit and finalise the draft content
+            context["new_content"] = context.get("content", "Document content goes here.")
+            context = self.perform("edit_draft", context)
+            print(f"     Draft edited (v{context['document'].version}).")
+            # Submit the draft into the approval workflow
+            context = self.perform("submit", context)
+            print(f"     Document submitted for approval (SUBMITTED).")
+            return bus.publish(Event("document_submitted", self.name), context)
+        elif event.name == "document_rejected":
+            doc: Document = context["document"]
+            # Return the document to DRAFT state for revision
+            doc.transition(DocumentState.DRAFT)
+            context["new_content"] = context.get(
+                "revised_content", context.get("content", "Revised document content.")
+            )
+            context = self.perform("edit_draft", context)
+            print(f"     Draft revised after rejection (v{doc.version}).")
+            # Re-submit the revised draft
+            context = self.perform("submit", context)
+            print(f"     Revised document re-submitted for approval (SUBMITTED).")
+            return bus.publish(Event("document_submitted", self.name), context)
+        else:
+            raise NotImplementedError(
+                f"AuthorActor.on_event('{event.name}') is not implemented."
+            )
+
 
 class ApproverActor(Actor):
     """
@@ -715,10 +966,16 @@ class ApproverActor(Actor):
       - How is an approver assigned? (role-based, document-category, manual)
       - What is the SLA for approval? (see WI-004 equivalent in validate())
       - Can an approver delegate to another approver?
+
+    Event subscriptions:
+      - document_assigned_for_review → review the document; publish
+        document_approved or document_rejected based on the decision.
     """
 
     name = "Approver"
     description = "Reviews submitted documents and approves or rejects them."
+    subscriptions = ["document_assigned_for_review"]
+    publishes = ["document_approved", "document_rejected"]
 
     def perform(self, action: str, context: dict[str, Any]) -> dict[str, Any]:
         if action == "approve":
@@ -749,6 +1006,32 @@ class ApproverActor(Actor):
         # GAP: Implement notification — email, Slack, or workflow system.
         raise NotImplementedError("ApproverActor.notify() is not implemented.")
 
+    def on_event(self, event: Event, bus: EventBus, context: dict[str, Any]) -> dict[str, Any]:
+        if event.name == "document_assigned_for_review":
+            doc: Document = context["document"]
+            doc.transition(DocumentState.IN_REVIEW)
+            decision = context.get("approval_decision", "approve")
+            context["approver_id"] = context.get("approver_id", "approver_001")
+            if decision == "approve":
+                context = self.perform("approve", context)
+                print(f"     Document APPROVED by {context['approver_id']}.")
+                return bus.publish(Event("document_approved", self.name), context)
+            elif decision == "reject":
+                context["rejection_reason"] = context.get(
+                    "rejection_reason", "Does not meet content standards."
+                )
+                context = self.perform("reject", context)
+                print(f"     Document REJECTED: {context['rejection_reason']}")
+                return bus.publish(Event("document_rejected", self.name), context)
+            else:
+                raise NotImplementedError(
+                    f"ApproverActor.on_event: unknown decision '{decision}'."
+                )
+        else:
+            raise NotImplementedError(
+                f"ApproverActor.on_event('{event.name}') is not implemented."
+            )
+
 
 class SystemActor(Actor):
     """
@@ -756,10 +1039,16 @@ class SystemActor(Actor):
 
     Responsible for: routing documents, applying access policies,
     sending system notifications, and publishing to the intranet.
+
+    Event subscriptions:
+      - document_submitted    → assign an approver and route for review.
+      - access_policy_set     → publish the document with access controls.
     """
 
     name = "System"
     description = "Automated platform actions: routing, publishing, notifications."
+    subscriptions = ["document_submitted", "access_policy_set"]
+    publishes = ["document_assigned_for_review", "document_published"]
 
     def perform(self, action: str, context: dict[str, Any]) -> dict[str, Any]:
         if action == "route_to_approver":
@@ -792,6 +1081,25 @@ class SystemActor(Actor):
         """Send a system notification. Stub — replace with real dispatch."""
         print(f"  [SYSTEM NOTIFICATION] {message}")
 
+    def on_event(self, event: Event, bus: EventBus, context: dict[str, Any]) -> dict[str, Any]:
+        if event.name == "document_submitted":
+            # GAP: Approver assignment logic is not yet defined.
+            # For now, use the approver_id already present in context (if any).
+            assigned = context.get("approver_id", "approver_001")
+            context["assigned_approver"] = assigned
+            print(f"     Routing document to approver: {assigned}")
+            return bus.publish(Event("document_assigned_for_review", self.name), context)
+        elif event.name == "access_policy_set":
+            context = self.perform("publish", context)
+            print(f"     Document PUBLISHED at {context.get('published_url', 'unknown URL')}.")
+            # GAP: apply_access_policy not yet implemented.
+            # context = self.perform("apply_access_policy", context)
+            return bus.publish(Event("document_published", self.name), context)
+        else:
+            raise NotImplementedError(
+                f"SystemActor.on_event('{event.name}') is not implemented."
+            )
+
 
 class AdminActor(Actor):
     """
@@ -803,10 +1111,16 @@ class AdminActor(Actor):
     GAP: The exact boundary between Approver and Admin responsibilities
     around access policy is not defined.  Does the Approver set the
     access level as part of approval, or does Admin set it post-publication?
+
+    Event subscriptions:
+      - document_approved → set the access policy for the approved document
+        and publish access_policy_set to trigger publication.
     """
 
     name = "Admin"
     description = "Manages access policies, user groups, and escalations."
+    subscriptions = ["document_approved"]
+    publishes = ["access_policy_set"]
 
     def perform(self, action: str, context: dict[str, Any]) -> dict[str, Any]:
         raise NotImplementedError(
@@ -815,6 +1129,19 @@ class AdminActor(Actor):
 
     def notify(self, message: str, context: dict[str, Any]) -> None:
         raise NotImplementedError("AdminActor.notify() is not implemented.")
+
+    def on_event(self, event: Event, bus: EventBus, context: dict[str, Any]) -> dict[str, Any]:
+        if event.name == "document_approved":
+            # GAP: Access policy assignment logic is not yet defined.
+            # For now, apply a default INTERNAL access policy.
+            policy = AccessPolicy()
+            context["access_policy"] = policy
+            print(f"     Access policy set (default: INTERNAL).")
+            return bus.publish(Event("access_policy_set", self.name), context)
+        else:
+            raise NotImplementedError(
+                f"AdminActor.on_event('{event.name}') is not implemented."
+            )
 
 
 # ---------------------------------------------------------------------------
@@ -1105,15 +1432,61 @@ class DocumentApprovalProcess(Process):
 # ===========================================================================
 
 def _is_not_implemented(cls: type, method_name: str) -> bool:
-    """Return True if the named method raises NotImplementedError."""
+    """
+    Return True if the named method's entire body is a bare ``raise NotImplementedError``.
+
+    A method is considered "not implemented" only when its body (excluding any
+    leading docstring) consists of exactly one statement that is an unconditional
+    ``raise NotImplementedError(...)`` call.  Methods that raise NotImplementedError
+    inside branches (e.g. ``else: raise NotImplementedError``) are considered
+    implemented — the raise is a defensive guard, not a gap marker.
+    """
+    import ast
+
     method = getattr(cls, method_name, None)
     if method is None:
         return True
     try:
         src = inspect.getsource(method)
-        return "NotImplementedError" in src
-    except (OSError, TypeError):
+        src = textwrap.dedent(src)
+        tree = ast.parse(src)
+    except (OSError, TypeError, SyntaxError):
         return False
+
+    func_def = next(
+        (node for node in ast.walk(tree) if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))),
+        None,
+    )
+    if func_def is None:
+        return False
+
+    # Strip leading docstring (an Expr node containing a constant)
+    body = func_def.body
+    if (
+        body
+        and isinstance(body[0], ast.Expr)
+        and isinstance(body[0].value, ast.Constant)
+    ):
+        body = body[1:]
+
+    if len(body) != 1 or not isinstance(body[0], (ast.Raise, ast.Pass)):
+        return False
+
+    if isinstance(body[0], ast.Pass):
+        return True
+
+    raise_node: ast.Raise = body[0]
+    if raise_node.exc is None:
+        return False
+
+    exc = raise_node.exc
+    # raise NotImplementedError or raise NotImplementedError(...)
+    if isinstance(exc, ast.Call):
+        func = exc.func
+        return isinstance(func, ast.Name) and func.id == "NotImplementedError"
+    if isinstance(exc, ast.Name):
+        return exc.id == "NotImplementedError"
+    return False
 
 
 def _camel_to_label(name: str) -> str:
@@ -1133,10 +1506,13 @@ if __name__ == "__main__":
     process.validate()
     process.report()
 
-    # 2. Show the Mermaid diagram
+    # 2. Show the step-based Mermaid diagram
     process.print_mermaid()
 
-    # 3. Run with a mock context (approved path)
+    # 3. Show the event-driven Mermaid diagram
+    process.print_event_mermaid()
+
+    # 4. Run with a mock context using the original sequential step execution
     mock_context = {
         "user_id":           "alice@example.com",
         "title":             "Q3 Engineering Update",
@@ -1145,3 +1521,45 @@ if __name__ == "__main__":
         "approver_id":       "bob@example.com",
     }
     process.run(mock_context)
+
+    # 5. Run event-driven — approved path
+    #    The process is started by publishing an initial event that simulates
+    #    an external request arriving (e.g. a user clicking "New Document").
+    print("--- Event-driven: approve path ---")
+    event_context = {
+        "user_id":           "alice@example.com",
+        "title":             "Q4 Engineering Update",
+        "content":           "This quarter we delivered...",
+        "approval_decision": "approve",
+        "approver_id":       "bob@example.com",
+    }
+    initial_event = Event(name="document_creation_requested", source="System")
+    process.run_event_driven(initial_event, event_context)
+
+    # 6. Run event-driven — rejection then re-approval path
+    #    Demonstrates the event cycle: reject → author revises → re-submit → approve.
+    print("--- Event-driven: reject then approve path ---")
+
+    class DemoApprover(ApproverActor):
+        """Approver that rejects on the first review and approves on the second."""
+        def on_event(self, event: Event, bus: EventBus, context: dict[str, Any]) -> dict[str, Any]:
+            review_count = context.get("review_count", 0) + 1
+            context["review_count"] = review_count
+            context["approval_decision"] = "reject" if review_count == 1 else "approve"
+            if review_count == 2:
+                context["revised_content"] = "Full revised content with expanded section 2."
+            return super().on_event(event, bus, context)
+
+    class DemoProcess(DocumentApprovalProcess):
+        def actors(self) -> list[Type[Actor]]:
+            return [AuthorActor, DemoApprover, AdminActor, SystemActor]
+
+    demo = DemoProcess()
+    reject_context = {
+        "user_id":          "carol@example.com",
+        "title":            "Annual Security Review",
+        "content":          "Draft content — needs more detail.",
+        "rejection_reason": "Content is too brief; please expand section 2.",
+        "approver_id":      "dave@example.com",
+    }
+    demo.run_event_driven(Event(name="document_creation_requested", source="System"), reject_context)
