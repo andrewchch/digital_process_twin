@@ -818,9 +818,6 @@ class TestProcessRunEventDriven(unittest.TestCase):
 
     def test_reject_then_approve_path(self):
         """Verify the reject → revise → resubmit → approve cycle works end-to-end."""
-        from process_model import Any as _Any  # noqa — avoid shadowing Any
-
-        review_calls: list[int] = []
 
         class CountingApprover(ApproverActor):
             def on_event(self, event, bus, context):
